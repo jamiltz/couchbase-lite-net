@@ -142,7 +142,11 @@ namespace Couchbase.Lite
         /// Defines the interval (in seconds) between polls in continuous ("long poll") replication mode.  
         /// Default is 0, which means try again immediately.
         /// </summary>
-        public static readonly string PollInterval = ReplicationOptionsDictionary.PollInterval;
+        public static readonly string PollInterval = ReplicationOptionsDictionary.PollIntervalKey;
+
+        public static readonly string PurgePushed = ReplicationOptionsDictionary.PurgePushedKey;
+
+        public static readonly string AllNew = ReplicationOptionsDictionary.AllNewKey;
     }
 
     /// <summary>
@@ -150,7 +154,9 @@ namespace Couchbase.Lite
     /// </summary>
     [DictionaryContract(OptionalKeys=new object[] { 
         ReplicationOptionsDictionary.RemoteUUIDKey, typeof(string),
-        ReplicationOptionsDictionary.PollInterval, typeof(double)
+        ReplicationOptionsDictionary.PollIntervalKey, typeof(double),
+        ReplicationOptionsDictionary.PurgePushedKey, typeof(bool),
+        ReplicationOptionsDictionary.AllNewKey, typeof(bool)
     })]
     public sealed class ReplicationOptionsDictionary : ContractedDictionary
     {
@@ -162,7 +168,9 @@ namespace Couchbase.Lite
         public const string REMOTE_UUID_KEY = "remoteUUID";
 
         internal const string RemoteUUIDKey = "remoteUUID";
-        internal const string PollInterval = "poll";
+        internal const string PollIntervalKey = "poll";
+        internal const string PurgePushedKey = "purgePushed";
+        internal const string AllNewKey = "allNew";
     }
 
     /// <summary>
