@@ -54,6 +54,9 @@ using Couchbase.Lite.Storage.ForestDB;
 using Couchbase.Lite.Configuration;
 using System.IO;
 using System.Text;
+using System.Threading;
+using System.Net.Sockets;
+using System.Linq;
 
 namespace Couchbase.Lite
 {
@@ -86,6 +89,19 @@ namespace Couchbase.Lite
             Assert.IsInstanceOf<DateTimeOffset>(resultObj);
             Assert.AreEqual(expectedTime, resultObj);
             Assert.AreEqual(expectedTime.Offset, ((DateTimeOffset)resultObj).Offset);
+        }
+
+        [Test]
+        public void TestExceptionEnumerable()
+        {
+            var innerException = new SocketException();
+            var nextException = new HttpRequestException("Socket exception", innerException);
+            var otherNextException = new CouchbaseLiteException();
+            var aggregate = new AggregateException("OMG", nextException, otherNextException);
+
+            Assert.IsTrue(Misc.IsTransientNetworkError(aggregate));
+            CollectionAssert.AreEqual(new Exception[] { innerException, nextException, otherNextException  }, 
+                new ExceptionEnumerable(aggregate).ToArray());
         }
 
         [Test]

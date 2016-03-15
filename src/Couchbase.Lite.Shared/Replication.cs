@@ -427,8 +427,9 @@ namespace Couchbase.Lite
             set
             {
                 if (value != _lastError) {
-                    Log.To.Sync.I(TAG, "Error set during replication (application may continue)", value);
-                    _lastError = value;
+                    var newException = value == null ? null : value.Flatten().FirstOrDefault();
+                    Log.To.Sync.I(TAG, " Progress: set error = {0}", (object)newException);
+                    _lastError = newException;
                     NotifyChangeListeners();
                 }
             }
@@ -1159,10 +1160,11 @@ namespace Couchbase.Lite
 
             _continuous = false;
             if (Batcher != null)  {
-                Batcher.FlushAll();
+                Batcher.Clear();
             }
 
             CancelPendingRetryIfReady();
+            FireTrigger(ReplicationTrigger.StopImmediate);
         }
 
         #endregion
@@ -1332,8 +1334,23 @@ namespace Couchbase.Lite
                 message.Headers.Add("Accept", "*/*");
                 AddRequestHeaders(message);
 
-                _client.Authenticator = Authenticator;
-                _client.SendAsync(message, CancellationTokenSource.Token).ContinueWith(new Action<Task<HttpResponseMessage>>(responseMessage =>
+                var client = _clientFactory.GetHttpClient(_cookieStore, true);
+                var challengeResponseAuth = Authenticator as IChallengeResponseAuthenticator;
+                if (challengeResponseAuth != null) {
+                    var authHandler = _clientFactory.Handler as DefaultAuthHandler;
+                    if (authHandler != null) {
+                        authHandler.Authenticator = challengeResponseAuth;
+                    }
+
+                    challengeResponseAuth.PrepareWithRequest(message);
+                }
+
+                var authHeader = AuthUtils.GetAuthenticationHeaderValue(Authenticator, message.RequestUri);
+                if (authHeader != null) {
+                    client.DefaultRequestHeaders.Authorization = authHeader;
+                }
+
+                var request = client.SendAsync(message, CancellationTokenSource.Token).ContinueWith(new Action<Task<HttpResponseMessage>>(responseMessage =>
                 {
                     object fullBody = null;
                     Exception error = null;
@@ -1372,7 +1389,6 @@ namespace Couchbase.Lite
                                     reader.SetContentType(contentType);
 
                                     var inputStreamTask = entity.ReadAsStreamAsync();
-                                    //inputStreamTask.Wait(90000, CancellationTokenSource.Token);
                                     inputStream = inputStreamTask.Result;
 
                                     const int bufLen = 1024;
@@ -1424,9 +1440,13 @@ namespace Couchbase.Lite
                         Log.To.Sync.W(TAG, "Got exception during SendAsyncMultipartDownload, aborting...");
                         error = e;
                     } finally {
+                        Task dummy;
+                        client.Dispose();
+                        _requests.TryRemove(message, out dummy);
                         responseMessage.Result.Dispose();
                     }
                 }), WorkExecutor.Scheduler);
+                _requests.TryAdd(message, request);
             } catch (UriFormatException e) {
                 Log.To.Sync.W(TAG, "Malformed URL for async request, aborting...", e);
             }

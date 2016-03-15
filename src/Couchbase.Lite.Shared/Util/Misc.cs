@@ -238,7 +238,7 @@ namespace Couchbase.Lite
             return param.Replace("\"", string.Empty);
         }
 
-        public static HttpStatusCode? GetStatusCode(WebException we)
+		public static HttpStatusCode? GetStatusCode(WebException we)
         {
             if (we == null || we.Response == null) {
                 return null;
@@ -252,32 +252,35 @@ namespace Couchbase.Lite
             return response.StatusCode;
         }
 
-        public static bool IsTransientNetworkError(Exception e)
+        public static bool IsTransientNetworkError(Exception error)
         {
-            var error = Misc.Flatten(e);
+            foreach (var exception in error.Flatten()) {
+                if (exception is IOException
+                    || exception is TimeoutException
+                    || exception is SocketException) {
+                    return true;
+                }
 
-            if (error is IOException
-                || error is TimeoutException
-                || error is SocketException) {
-                return true;
-            }
+                var we = exception as WebException;
+                if (we == null) {
+                    continue;
+                }
 
-            var we = e as WebException;
-            if (we == null) {
-                return false;
-            }
-
-            if (we.Status == WebExceptionStatus.ConnectFailure || we.Status == WebExceptionStatus.Timeout ||
+                if (we.Status == WebExceptionStatus.ConnectFailure || we.Status == WebExceptionStatus.Timeout ||
                 we.Status == WebExceptionStatus.ConnectionClosed || we.Status == WebExceptionStatus.RequestCanceled) {
-                return true;
+                    return true;
+                }
+
+                if (we.Response == null) {
+                    continue;
+                }
+
+                if (IsTransientError(((HttpWebResponse)we.Response).StatusCode)) {
+                    return true;
+                }
             }
 
-            var statusCode = GetStatusCode(we);
-            if (!statusCode.HasValue) {
-                return false;
-            }
-
-            return IsTransientError(statusCode.Value);
+            return false;
         }
 
         public static bool IsTransientError(HttpResponseMessage response)
