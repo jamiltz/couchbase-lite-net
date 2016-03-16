@@ -1018,6 +1018,8 @@ namespace Couchbase.Lite
             }
 
             _startTime = DateTime.UtcNow;
+            var reachabilityManager = LocalDatabase.Manager.NetworkReachabilityManager;
+            reachabilityManager.StatusChanged += NetworkStatusChanged;
             if (!LocalDatabase.Manager.NetworkReachabilityManager.CanReach(RemoteUrl.AbsoluteUri)) {
                 LastError = LocalDatabase.Manager.NetworkReachabilityManager.LastError;
                 FireTrigger(ReplicationTrigger.GoOffline);
@@ -1034,9 +1036,6 @@ namespace Couchbase.Lite
             _client = _clientFactory.GetHttpClient(_cookieStore, true);
 
             CheckSession();
-
-            var reachabilityManager = LocalDatabase.Manager.NetworkReachabilityManager;
-            reachabilityManager.StatusChanged += NetworkStatusChanged;
         }
 
         /// <summary>
@@ -2075,6 +2074,8 @@ namespace Couchbase.Lite
                     return;
                 }
 
+                Log.V(TAG, "[Idle OnEntry] {0} => {1} ({2})", transition.Source, transition.Destination, _replicatorID);
+
                 if(_revisionsFailed > 0) {
                     ScheduleRetryIfReady();
                 }
@@ -2253,6 +2254,10 @@ namespace Couchbase.Lite
             _changesCount = sender.ChangesCount;
             _completedChangesCount = sender.CompletedChangesCount;
             _status = sender.Status;
+            if (_status == ReplicationStatus.Offline && transition != null && transition.Destination == ReplicationState.Running) {
+                _status = ReplicationStatus.Active;
+            }
+
             _lastError = sender.LastError;
         }
     }
