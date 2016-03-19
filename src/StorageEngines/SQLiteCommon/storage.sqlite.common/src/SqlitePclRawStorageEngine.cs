@@ -134,6 +134,7 @@ namespace Couchbase.Lite.Storage.SQLCipher
             Path = path;
             _readOnly = readOnly;
             Factory = new TaskFactory(new SingleThreadScheduler());
+            bool openedWrite = false;
 
             try {
                 shouldCommit = false;
@@ -154,6 +155,7 @@ namespace Couchbase.Lite.Storage.SQLCipher
 					}
 				}
 
+                openedWrite = true;
 				const int reader_flags = SQLITE_OPEN_FILEPROTECTION_COMPLETEUNLESSOPEN | SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX;
 				OpenSqliteConnection(reader_flags, encryptionKey, out _readConnection);
 
@@ -194,6 +196,7 @@ namespace Couchbase.Lite.Storage.SQLCipher
 
             Log.To.Database.I(TAG, "Open {0} (flags={1}{2})", Path, flags, (encryptionKey != null ? ", encryption key given" : ""));
 
+            raw.sqlite3_busy_timeout(db, 5000);
             raw.sqlite3_create_collation(db, "JSON", null, CouchbaseSqliteJsonUnicodeCollationFunction.Compare);
             raw.sqlite3_create_collation(db, "JSON_ASCII", null, CouchbaseSqliteJsonAsciiCollationFunction.Compare);
             raw.sqlite3_create_collation(db, "JSON_RAW", null, CouchbaseSqliteJsonRawCollationFunction.Compare);
@@ -212,15 +215,14 @@ namespace Couchbase.Lite.Storage.SQLCipher
 
             var result = -1;
             try {
-                LastErrorCode = raw.sqlite3_step(statement);
-                if (LastErrorCode != raw.SQLITE_ERROR) {
-                    Debug.Assert(LastErrorCode == raw.SQLITE_ROW);
-                    result = raw.sqlite3_column_int(statement, 0);
-                }
+                LastErrorCode = statement.step();
+                result = raw.sqlite3_column_int(statement, 0);
             } catch (Exception e) {
                 Log.To.Database.E(TAG, "Error getting user version", e);
             } finally {
-                statement.Dispose();
+                if (statement != null) {
+                    statement.Dispose();
+                }
             }
 
             return result;
@@ -253,15 +255,16 @@ namespace Couchbase.Lite.Storage.SQLCipher
                     Log.To.Database.W(TAG, "Error getting user version, recording error...", e);
                     LastErrorCode = raw.sqlite3_errcode(_writeConnection);
                 } finally {
-                    statement.Dispose();
+                    if(statement != null) {
+                        statement.Dispose();
+                    }
                 }
             });
         }
 
         public bool IsOpen
         {
-            get
-            {
+            get {
                 return _writeConnection != null;
             }
         }
@@ -400,6 +403,7 @@ namespace Couchbase.Lite.Storage.SQLCipher
                     LastErrorCode = raw.sqlite3_errcode(_writeConnection);
                     throw;
                 }
+
                 return cursor;
             });
 
@@ -434,13 +438,11 @@ namespace Couchbase.Lite.Storage.SQLCipher
                         command.Dispose ();
                     }
 
-                    var args = new SecureLogJsonString(paramArgs, LogMessageSensitivity.PotentiallyInsecure);
-                    Log.To.Database.E (TAG, String.Format("Error executing raw query '{0}' with values '{1}', rethrowing...", 
-                        sql, paramArgs == null ? (object)String.Empty : 
-                        new SecureLogJsonString(args, LogMessageSensitivity.PotentiallyInsecure)), e);
-                    LastErrorCode = raw.sqlite3_errcode(_readConnection);
-                    throw;
-                }
+                    Log.E (TAG, "Error executing raw query '{0}' values '{1}'", sql, 
+                        paramArgs == null ? "(null)" : Manager.GetObjectMapper().WriteValueAsString(paramArgs));
+                    LogAndSetError(e, _readConnection, true);
+                } 
+
                 return cursor;
             });
 
@@ -466,15 +468,10 @@ namespace Couchbase.Lite.Storage.SQLCipher
             var t = Factory.StartNew(() =>
             {
                 var lastInsertedId = -1L;
-                var command = GetInsertCommand(table, initialValues, conflictResolutionStrategy);
-
+                sqlite3_stmt command = null;
                 try {
+                    command = GetInsertCommand(table, initialValues, conflictResolutionStrategy);
                     LastErrorCode = command.step();
-                    command.Dispose();
-                    if (LastErrorCode == raw.SQLITE_ERROR) {
-                        throw Misc.CreateExceptionAndLog(Log.To.Database, StatusCode.DbError, TAG,
-                            raw.sqlite3_errmsg(_writeConnection));
-                    }
 
                     int changes = _writeConnection.changes();
                     if (changes > 0)
@@ -488,18 +485,16 @@ namespace Couchbase.Lite.Storage.SQLCipher
                                 "Error inserting {0} using {1}", initialValues, command);
                         }
                     } else {
-                        Log.To.Database.V(TAG, "Inserting row {0} into {1} with values {2}", lastInsertedId, table, initialValues);
+                        Log.V(TAG, "Inserting row {0} into {1} with values {2}", lastInsertedId, table, initialValues);
                     }
 
-                } 
-                catch(CouchbaseLiteException) {
-                    LastErrorCode = raw.sqlite3_errcode(_writeConnection);
-                    Log.To.Database.E(TAG, "Error inserting into table {0}, rethrowing...", table);
-                    throw;
                 } catch (Exception ex) {
-                    LastErrorCode = raw.sqlite3_errcode(_writeConnection);
-                    throw Misc.CreateExceptionAndLog(Log.To.Database, ex, TAG, 
-                        "Error inserting into table {0}", table);
+                    Log.E(TAG, "Error inserting into table {0}", table);
+                    LogAndSetError(ex, _writeConnection, true);
+                } finally {
+                    if(command != null) {
+                        command.Dispose();
+                    }
                 }
 
                 return lastInsertedId;
@@ -525,29 +520,22 @@ namespace Couchbase.Lite.Storage.SQLCipher
             var t = Factory.StartNew(() =>
             {
                 var resultCount = 0;
-                var command = GetUpdateCommand(table, values, whereClause, whereArgs);
-                try
-                {
+                sqlite3_stmt command = null;
+                try {
+                    command = GetUpdateCommand(table, values, whereClause, whereArgs);
                     LastErrorCode = command.step();
-                    if (LastErrorCode == raw.SQLITE_ERROR)
-                        throw new CouchbaseLiteException(raw.sqlite3_errmsg(_writeConnection),
-                            StatusCode.DbError);
                 }
-                catch (ugly.sqlite3_exception ex)
+                catch (Exception ex)
                 {
-                    LastErrorCode = raw.sqlite3_errcode(_writeConnection);
-                    var msg = raw.sqlite3_extended_errcode(_writeConnection);
-                    Log.To.Database.E(TAG, String.Format("Error {0}: \"{1}\" while updating table {2}", ex.errcode, msg, table), ex);
+                    Log.E(TAG, "Error running UPDATE command on {0} with {1}", table, values);
+                    LogAndSetError(ex, _writeConnection, true);
+                } finally {
+                    if(command != null) {
+                        command.Dispose();
+                    }
                 }
 
-                resultCount = _writeConnection.changes();
-                if (resultCount < 0)
-                {
-                    throw Misc.CreateExceptionAndLog(Log.To.Database, StatusCode.DbError, TAG,
-                        "Error updating {0} with command '{1}'", values, command);
-                }
-                command.Dispose();
-                return resultCount;
+                return _writeConnection.changes();
             }, CancellationToken.None);
 
             // NOTE.ZJG: Just a sketch here. Needs better error handling, etc.
@@ -576,28 +564,18 @@ namespace Couchbase.Lite.Storage.SQLCipher
                 try
                 {
                     var result = command.step();
-                    if (result == raw.SQLITE_ERROR) {
-                        throw Misc.CreateExceptionAndLog(Log.To.Database, StatusCode.DbError, TAG,
-                            "Error deleting from table {0} ({1})", table, result);
-                    }
-
                     resultCount = _writeConnection.changes();
-                    if (resultCount < 0)
-                    {
-                        throw Misc.CreateExceptionAndLog(Log.To.Database, StatusCode.DbError, TAG,
-                            "Failed to delete the requested records");
+                    if (resultCount < 0) {
+                        throw new CouchbaseLiteException("Failed to delete the records.", StatusCode.DbError);
                     }
 
-                }
-                catch (Exception ex)
-                {
-                    LastErrorCode = raw.sqlite3_errcode(_writeConnection);
-                    Log.To.Database.E(TAG, String.Format("Error {0} when deleting from table {1}, rethrowing...", _writeConnection.extended_errcode(), table), ex);
-                    throw;
-                }
-                finally
-                {
-                    command.Dispose();
+                } catch (Exception ex) {
+                    Log.E(TAG, "Error running DELETE command on {0}", table);
+                    LogAndSetError(ex, _writeConnection, true);
+                } finally {
+                    if(command != null) {
+                        command.Dispose();
+                    }
                 }
                 return resultCount;
             });
@@ -666,6 +644,51 @@ namespace Couchbase.Lite.Storage.SQLCipher
 
         #region Non-public Members
 
+        private StatusCode ErrToStatus(int err)
+        {
+            switch (err) {
+                case raw.SQLITE_BUSY:
+                case raw.SQLITE_LOCKED:
+                    return StatusCode.DbBusy;
+                case raw.SQLITE_CORRUPT:
+                    return StatusCode.CorruptError;
+                case raw.SQLITE_NOTADB:
+                    return StatusCode.Unauthorized;
+                default:
+                    Log.V(TAG, "Other SQLite error code {0}, returning DbError", err);
+                    return StatusCode.DbError;
+            }
+        }
+
+        private void LogAndSetError(Exception e, sqlite3 reference, bool throwException)
+        {
+            var se = e as ugly.sqlite3_exception;
+            if (se != null) {
+                Log.E(TAG, "SQLite details:{0}\t{1}, {2} ({3})", Environment.NewLine, se.errcode,
+                    raw.sqlite3_extended_errcode(reference), se.errmsg);
+                LastErrorCode = se.errcode;
+                if (throwException) {
+                    throw new CouchbaseLiteException(ErrToStatus(se.errcode));
+                }
+
+                return;
+            }
+
+            var ce = e as CouchbaseLiteException;
+            if (ce != null) {
+                if (throwException) {
+                    throw ce;
+                }
+
+                return;
+            }
+
+            Log.E(TAG, "Details", e);
+            if (throwException) {
+                throw new CouchbaseLiteException("Exception during SQLite operation", e);
+            }
+        }
+
         private sqlite3_stmt BuildCommand(sqlite3 db, string sql, object[] paramArgs)
         {
             if (db == null) {
@@ -691,16 +714,13 @@ namespace Couchbase.Lite.Storage.SQLCipher
                 if (paramArgs != null && paramArgs.Length > 0 && command != null && LastErrorCode != raw.SQLITE_ERROR) {
                     command.bind(paramArgs);
                 }
-            } catch (CouchbaseLiteException) {
-                Log.To.Database.E(TAG, "Error when building sql '{0}' with params {1}, rethrowing...", sql, 
-                    new SecureLogJsonString(paramArgs, LogMessageSensitivity.PotentiallyInsecure));
-                throw;
             } catch (Exception e) {
-                throw Misc.CreateExceptionAndLog(Log.To.Database, e, TAG,
-                    "Error when building sql '{0}' with params {1}", sql, 
-                    new SecureLogJsonString(paramArgs, LogMessageSensitivity.PotentiallyInsecure));
+                Log.E(TAG, "Error when building sql '{0}' with params {1}", sql, 
+                    Manager.GetObjectMapper().WriteValueAsString(paramArgs));
+                LogAndSetError(e, db, true);
             }
 
+            Log.V(TAG, "Command built with SQL '{0}'", sql);
             return command;
         }
 
@@ -865,12 +885,9 @@ namespace Couchbase.Lite.Storage.SQLCipher
                         throw Misc.CreateExceptionAndLog(Log.To.Database, StatusCode.DbError, TAG,
                             "SQLite error in ExecSQL: {0}", raw.sqlite3_errmsg(db));
                     }
-                } catch (ugly.sqlite3_exception e) {
-                    Log.To.Database.E(TAG, String.Format("Error {0}, {1} ({2}) executing sql '{3}'", e.errcode, db.extended_errcode(), raw.sqlite3_errmsg(db), sql), e);
-                    LastErrorCode = e.errcode;
-                    throw Misc.CreateExceptionAndLog(Log.To.Database, StatusCode.DbError, TAG,
-                        "Error {0}, {1} ({2}) executing sql '{3}'", 
-                        e.errcode, db.extended_errcode(), raw.sqlite3_errmsg(db), sql);
+                } catch (Exception e) {
+                    Log.E(TAG, "Error executing SQL '{0}'", sql);
+                    LogAndSetError(e, db, true);
                 } finally {
                     if(command != null) {
                         command.Dispose();

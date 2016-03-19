@@ -1925,17 +1925,17 @@ namespace Couchbase.Lite
             view.SetMapReduce((doc, emit) =>
             {
                 emit(doc["jim"], doc["_id"]);
-            }, (keys, vals, rereduce) => 
-            {
-                return keys.Count();
-            }, "1");
+            }, BuiltinReduceFunctions.Count, "1");
             var query1 = view.CreateQuery().ToLiveQuery();
             query1.Start();
 
             var query2 = view.CreateQuery().ToLiveQuery();
             query2.Start();
 
-            var docIdTimestamp = Convert.ToString(DateTime.UtcNow.MillisecondsSinceEpoch());
+            var re = new AutoResetEvent(false);
+
+            var expected = 50;
+            var docIdTimestamp = Convert.ToString(Runtime.CurrentTimeMillis());
             for(int i = 0; i < 50; i++) {
                 database.GetDocument(string.Format("doc{0}-{1}", i, docIdTimestamp)).PutProperties(new Dictionary<string, object> { {
                         "jim",
@@ -1943,8 +1943,14 @@ namespace Couchbase.Lite
                     } });
             }
 
-            Sleep(5000);
-            Assert.AreEqual(50, view.TotalRows);
+            query1.Changed += (sender, e) => {
+                if(view.TotalRows == expected) {
+                    re.Set();
+                }
+            };
+
+            Assert.IsTrue(re.WaitOne(10000));
+            expected = 60;
             Assert.AreEqual(50, view.LastSequenceIndexed);
 
             query1.Stop();
@@ -1958,8 +1964,8 @@ namespace Couchbase.Lite
                 }
             }
 
-            Sleep(5000);
-            Assert.AreEqual(60, view.TotalRows);
+
+            Assert.IsTrue(re.WaitOne(10000));
             Assert.AreEqual(60, view.LastSequenceIndexed);
         }
 

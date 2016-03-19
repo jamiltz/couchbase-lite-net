@@ -1,4 +1,4 @@
-﻿//
+//
 //  SqliteCouchStore.cs
 //
 //  Author:
@@ -541,9 +541,10 @@ namespace Couchbase.Lite.Storage.SQLCipher
             } catch (Exception e) {
                 Log.To.Database.W(TAG, "Failed to created SQLite transaction, returning false" , e);
                 return false;
+            } else {
+                Log.I(TAG, "BEGIN SQLite transaction (level {0})", after);
+                return true;
             }
-
-            return true;
         }
 
         private bool EndTransaction(bool commit)
@@ -1782,16 +1783,19 @@ namespace Couchbase.Lite.Storage.SQLCipher
                 var sequence = 0L;
                 try {
                     sequence = InsertRevision(newRev, docNumericId, parentSequence, true, hasAttachments, json, docType);
-                } catch(Exception) {
-                    var lastCode = StorageEngine.LastErrorCode;
-                    if(lastCode != raw.SQLITE_CONSTRAINT) {
-                        throw Misc.CreateExceptionAndLog(Log.To.Database, LastDbError.Code, TAG,
-                            "Failed to insert revision {0} ({1})", newRev, lastCode);
+                } catch(CouchbaseLiteException e) {
+                    if(e.Code == StatusCode.DbError) {
+                        if(StorageEngine.LastErrorCode != raw.SQLITE_CONSTRAINT) {
+                            throw;
+                        }
                     }
 
                     Log.To.Database.I(TAG, "Duplicate rev insertion {0} / {1}", 
                         new SecureLogString(docId, LogMessageSensitivity.PotentiallyInsecure), newRevId);
                     newRev.SetBody(null);
+                } catch(Exception e) {
+                    Log.E(TAG, "Exception caught in PutRevision", e);
+                    throw;
                 }
 
                 // Make replaced rev non-current:
