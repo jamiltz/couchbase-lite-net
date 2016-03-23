@@ -50,38 +50,6 @@ using Couchbase.Lite.Store;
 using Couchbase.Lite.Util;
 
 namespace Couchbase.Lite {
-
-    internal sealed class RefCountReaderWriterLock
-    {
-        public readonly ReaderWriterLockSlim Lock;
-        private int _refCount;
-        private bool _disposed;
-
-        public RefCountReaderWriterLock()
-        {
-            Lock = new ReaderWriterLockSlim();
-            _refCount = 1;
-        }
-
-        public RefCountReaderWriterLock Acquire()
-        {
-            if (_disposed) {
-                throw new ObjectDisposedException("RefCountReaderWriterLock");
-            }
-
-            Interlocked.Increment(ref _refCount);
-            return this;
-        }
-
-        public void Release()
-        {
-            if (Interlocked.Decrement(ref _refCount) == 0) {
-                _disposed = true;
-                Lock.Dispose();
-            }
-        }
-    }
-
     // TODO: Either remove or update the API defs to indicate the enum value changes, and global scope.
     /// <summary>
     /// Indicates the collation to use for sorted items in the view
@@ -125,8 +93,8 @@ namespace Couchbase.Lite {
             remove { _changed = (TypedEventHandler<View, EventArgs>)Delegate.Remove(_changed, value); }
         }
 
-        private LinkedList<UpdateJob> _updateQueue;
-        private RefCountReaderWriterLock _updateQueueLock;
+        private static LockableLinkedListFactory<UpdateJob> _UpdateQueueFactory = 
+            new LockableLinkedListFactory<UpdateJob>();
 
         #endregion
 
@@ -202,16 +170,6 @@ namespace Couchbase.Lite {
             view.Database = database;
             storage.Delegate = view;
             view.Name = name;
-
-            var groupleader = view.ViewsInGroup().FirstOrDefault();
-            if (groupleader == null) {
-                view._updateQueue = new LinkedList<UpdateJob>();
-                view._updateQueueLock = new RefCountReaderWriterLock();
-            } else {
-                view._updateQueue = groupleader._updateQueue ?? new LinkedList<UpdateJob>();
-                view._updateQueueLock = groupleader._updateQueueLock != null ?
-                    groupleader._updateQueueLock.Acquire() : new RefCountReaderWriterLock();
-            }
 
             // means 'unknown'
             view.Collation = ViewCollation.Unicode;
@@ -315,7 +273,7 @@ namespace Couchbase.Lite {
         { 
             Storage.DeleteView();
             Database.ForgetView(Name);
-            _updateQueueLock.Release();
+            //_updateQueueLock.Release();
             Close();
         }
 
@@ -344,12 +302,12 @@ namespace Couchbase.Lite {
         {
             UpdateJob proposedJob = Storage.CreateUpdateJob(ViewsInGroup().Select(x => x.Storage));
             UpdateJob nextJob = null;
-            _updateQueueLock.Lock.EnterUpgradeableReadLock();
+            var updateQueue = _UpdateQueueFactory.ListForGroup(GroupName());
+            updateQueue.Lock();
             try {
-                if (_updateQueue.Count > 0) {
-                    nextJob = _updateQueue.FirstOrDefault(x => x.Equals(proposedJob));
+                if (updateQueue.Count > 0) {
+                    nextJob = updateQueue.FirstOrDefault(x => x.Equals(proposedJob));
                     if(nextJob == null) {
-                        _updateQueueLock.Lock.EnterWriteLock();
                         QueueUpdate(proposedJob);
                         nextJob = proposedJob;
                     } 
@@ -359,7 +317,7 @@ namespace Couchbase.Lite {
                     nextJob.Run();
                 }
             } finally {
-                _updateQueueLock.Lock.ExitUpgradeableReadLock();
+                updateQueue.Unlock();
             }
 
             nextJob.Wait();
@@ -464,35 +422,40 @@ namespace Couchbase.Lite {
 
         private IEnumerable<View> ViewsInGroup()
         {
-            var slash = Name.IndexOf('/');
-            if (slash != -1) {
-                var prefix = Name.Substring(0, slash);
-                return Database.GetAllViews().Where(v => v.Name.StartsWith(prefix));
+            var groupName = GroupName();
+            if(groupName != null) {
+                return Database.GetAllViews().Where(v => v.Name.StartsWith(groupName));
             } else {
                 return new List<View> { this };
             }
         }
 
+        private string GroupName()
+        {
+            var slash = Name.IndexOf('/');
+            if (slash != -1) {
+                return Name.Substring(0, slash);
+            }
+
+            return null;
+        }
+
         private UpdateJob QueueUpdate(UpdateJob job)
         {
+            var updateQueue = _UpdateQueueFactory.ListForGroup(GroupName());
             job.Finished += (sender, e) => {
-                _updateQueueLock.Lock.EnterWriteLock();
+                updateQueue.Lock();
                 try {
-                    _updateQueue.RemoveFirst();
-                    if(_updateQueue.Count > 0) {
-                        _updateQueue.First.Value.Run();
+                    updateQueue.RemoveFirst();
+                    if(updateQueue.Count > 0) {
+                        updateQueue.First.Value.Run();
                     }
                 } finally {
-                    _updateQueueLock.Lock.ExitWriteLock();
+                    updateQueue.Unlock();
                 }
             };
 
-            _updateQueueLock.Lock.EnterWriteLock();
-            try {
-                _updateQueue.AddLast(job);
-            } finally {
-                _updateQueueLock.Lock.ExitWriteLock();
-            }
+            updateQueue.AddLast(job);
 
             return job;
         }
